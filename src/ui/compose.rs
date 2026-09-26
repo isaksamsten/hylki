@@ -258,6 +258,8 @@ pub struct Compose {
     outbox_origin: Option<u32>,
     /// Recipient suggestions, filtered as the user types.
     suggestions: Vec<Suggestion>,
+    ldap_suggestions: Vec<Suggestion>,
+    ldap_generation: u64,
     /// Shared autocomplete popover and which field it's currently attached to.
     completion: gtk::Popover,
     completion_field: Option<Field>,
@@ -455,6 +457,9 @@ pub enum ComposeInput {
     OpenContacts,
     /// The given recipient field changed — refresh autocomplete.
     Suggest(Field),
+    /// Debounced LDAP lookup; ignore this if the recipient changed meanwhile.
+    LdapStart { field: Field, token: String, generation: u64 },
+    LdapResults { field: Field, token: String, generation: u64, matches: Vec<Suggestion> },
     /// Addresses just sent to from another composer: into this one's
     /// suggestions at once, without waiting for a reopen.
     AddSuggestions(Vec<Suggestion>),
@@ -989,6 +994,8 @@ impl Component for Compose {
             signature_position,
             attachments: prefill_attachments,
             suggestions,
+            ldap_suggestions: Vec::new(),
+            ldap_generation: 0,
             completion,
             completion_field: None,
             completion_list: None,
@@ -1895,7 +1902,69 @@ impl Component for Compose {
                     Field::Cc => &widgets.cc_row,
                     Field::Bcc => &widgets.bcc_row,
                 };
+                self.ldap_generation = self.ldap_generation.wrapping_add(1);
+                let generation = self.ldap_generation;
+                self.ldap_suggestions.clear();
+                let token = row.text().rsplit(',').next().unwrap_or("").trim().to_string();
+                if token.chars().count() >= 3 && token.len() <= 128 {
+                    let s = sender.input_sender().clone();
+                    gtk::glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(300), move || {
+                            let _ = s.send(ComposeInput::LdapStart { field, token, generation });
+                        },
+                    );
+                }
                 self.show_completion(field, row);
+            }
+
+            ComposeInput::LdapStart { field, token, generation } => {
+                if generation != self.ldap_generation {
+                    tracing::debug!("LDAP lookup skipped: recipient changed before debounce");
+                    break 'handle;
+                }
+                let row = match field {
+                    Field::To => &widgets.to_row,
+                    Field::Cc => &widgets.cc_row,
+                    Field::Bcc => &widgets.bcc_row,
+                };
+                if row.text().rsplit(',').next().unwrap_or("").trim() != token {
+                    tracing::debug!("LDAP lookup skipped: recipient text changed");
+                    break 'handle;
+                }
+                let dirs = crate::ldap::directories();
+                if dirs.is_empty() {
+                    tracing::debug!("LDAP lookup skipped: no configured directories");
+                    break 'handle;
+                }
+                let s = sender.input_sender().clone();
+                std::thread::spawn(move || {
+                    let matches = crate::ldap::search(&dirs, &token);
+                    let _ = s.send(ComposeInput::LdapResults { field, token, generation, matches });
+                });
+            }
+
+            ComposeInput::LdapResults { field, token, generation, matches } => {
+                if generation != self.ldap_generation {
+                    tracing::debug!(count = matches.len(), "LDAP suggestions discarded: recipient changed during search");
+                    break 'handle;
+                }
+                let row = match field {
+                    Field::To => &widgets.to_row,
+                    Field::Cc => &widgets.cc_row,
+                    Field::Bcc => &widgets.bcc_row,
+                };
+                if row.text().rsplit(',').next().unwrap_or("").trim() != token {
+                    tracing::debug!(count = matches.len(), "LDAP suggestions discarded: recipient text changed");
+                    break 'handle;
+                }
+                let focused = recipient_focused(row);
+                tracing::debug!(count = matches.len(), focused, "LDAP suggestions received by composer");
+                self.ldap_suggestions = matches;
+                if focused {
+                    self.show_completion(field, row);
+                } else {
+                    tracing::debug!("LDAP completion not shown: recipient field is not focused");
+                }
             }
 
             ComposeInput::AddSuggestions(new) => {
@@ -2304,7 +2373,10 @@ impl Compose {
     fn ranked_matches(&self, token: &str) -> Vec<Suggestion> {
         let q = token.to_lowercase();
         let mut matches: Vec<Suggestion> =
-            self.suggestions.iter().filter(|s| s.matches(token)).cloned().collect();
+            self.suggestions.iter().chain(&self.ldap_suggestions)
+                .filter(|s| s.matches(token)).cloned().collect();
+        let mut seen = std::collections::HashSet::new();
+        matches.retain(|s| seen.insert(s.email.to_lowercase()));
         matches.sort_by(|a, b| {
             let pa = a.email.to_lowercase().starts_with(&q) || a.name.to_lowercase().starts_with(&q);
             let pb = b.email.to_lowercase().starts_with(&q) || b.name.to_lowercase().starts_with(&q);
@@ -2351,14 +2423,20 @@ impl Compose {
         list.set_can_focus(false);
         list.add_css_class("autocomplete");
         let count = matches.len();
+        let ldap_emails: std::collections::HashSet<String> = self.ldap_suggestions
+            .iter()
+            .map(|s| s.email.to_lowercase())
+            .collect();
         for sug in matches {
             let item = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             item.set_margin_start(6);
             item.set_margin_end(6);
             item.set_margin_top(3);
             item.set_margin_bottom(3);
-            // Mark where the suggestion came from: address book vs. mail history.
-            let icon = gtk::Image::from_icon_name(if sug.from_contacts {
+            // Distinguish directory results from local contacts and mail history.
+            let icon = gtk::Image::from_icon_name(if ldap_emails.contains(&sug.email.to_lowercase()) {
+                "avatar-default-symbolic"
+            } else if sug.from_contacts {
                 "avatar-default-symbolic"
             } else {
                 "document-open-recent-symbolic"
@@ -2878,6 +2956,15 @@ fn inner_text(widget: &gtk::Widget) -> Option<gtk::Text> {
         child = c.next_sibling();
     }
     None
+}
+
+/// EntryRow is a container: focus belongs to its internal GtkText, not
+/// the row itself. Check the actual window focus rather than row.has_focus().
+fn recipient_focused(row: &adw::EntryRow) -> bool {
+    row.root()
+        .and_downcast::<gtk::Window>()
+        .and_then(|w| gtk::prelude::GtkWindowExt::focus(&w))
+        .is_some_and(|focus| focus == *row.upcast_ref::<gtk::Widget>() || focus.is_ancestor(row))
 }
 
 /// Whether an OpenPGP send can go ahead (#133): a key of the user's own

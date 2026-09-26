@@ -14,6 +14,7 @@ pub mod grab_pill;
 pub mod icon_picker;
 pub mod initials;
 pub mod launch;
+pub mod ldap_directories;
 pub mod message_list;
 pub mod message_view;
 pub mod message_window;

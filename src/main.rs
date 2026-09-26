@@ -12,6 +12,8 @@ mod color;
 mod config;
 mod console_log;
 mod contacts;
+mod ldap;
+
 mod datefmt;
 mod desktop;
 mod goa;

@@ -658,6 +658,7 @@ const SIDE_PAGES: &[(&str, &[SidePage])] = &[
             SidePage { id: "tags", title: i18n_noop("Tags"), icon: "tag-outline-symbolic", accounts: true },
             SidePage { id: "filters", title: i18n_noop("Filters"), icon: "filter-folder-symbolic", accounts: true },
             SidePage { id: "senders", title: i18n_noop("Senders"), icon: "contact-new-symbolic", accounts: true },
+            SidePage { id: "ldap", title: i18n_noop("LDAP Directories"), icon: "system-users-symbolic", accounts: false },
             SidePage { id: "openpgp", title: i18n_noop("OpenPGP"), icon: "channel-secure-symbolic", accounts: false },
             SidePage { id: "cloud", title: i18n_noop("Cloud Storage"), icon: "cloud-symbolic", accounts: false },
         ],
@@ -1637,6 +1638,9 @@ impl Component for Preferences {
                             // Cloud attachment accounts (#144), its own component.
                             #[name = "cloud_slot"]
                             add_named[Some("cloud")] = &adw::Bin {},
+
+                            #[name = "ldap_slot"]
+                            add_named[Some("ldap")] = &adw::Bin {},
 
                             add_named[Some("general")] = &adw::PreferencesPage {
                                 add = &adw::PreferencesGroup {
@@ -3993,6 +3997,7 @@ impl Component for Preferences {
             .set_selected(if init.settings_open_accounts { 1 } else { 0 });
 
         widgets.accounts_slot.set_child(Some(&init.accounts_panel));
+        widgets.ldap_slot.set_child(Some(&crate::ui::ldap_directories::page()));
         let pgp = crate::ui::pgp_keys::PgpKeys::builder()
             .launch(crate::ui::pgp_keys::PgpKeysInit { identities: init.identities.clone() })
             .detach();
